@@ -68,9 +68,13 @@ class Translator(object):
                 if early_stopping >= early_stopping_criteria:
                     break
 
+                # i love dogs <pad> <pad> <pad>
                 x = x.to(self.cuda)
+
+                # <sos> jeg elsker hunder <eos> <pad>
                 y = y.to(self.cuda)
 
+                # <sos> jeg elsker hunder <eos> <pad>
                 output_sentence = self.model(x, y).to(
                     self.cuda)[:, :-1]  # predictions, beyond <sos>
                 target_sentence = y[:, 1:]
@@ -181,7 +185,8 @@ class Translator(object):
         translation = [word for word in translation if word != '<sos>']
         translation = [word for word in translation if word != '<eos>']
 
-        translation = ' '.join(translation).replace('<pad>', '')
+        translation = ' '.join(
+            list(filter(lambda x: x != '<pad>', translation)))
 
         return translation
 
@@ -258,3 +263,93 @@ class Translator(object):
                               weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothie)
 
         return bleu1, bleu2, bleu3, bleu4
+
+    def _generate_n_predictions(self, input_indices, output_indices, beam_n, level):
+        output = self.model(input_indices, output_indices)
+        probs = torch.log(nn.Softmax(dim=2)(output))
+        top_probs, top_indices = torch.topk(probs, k=beam_n, dim=2)
+
+        return top_probs[0, level], top_indices[0, level]
+
+    def _beam(self, input_indices, output_indices, top_indices, top_probs, beam_n, level_threshold, beam_dict={}, level=0, history_index='', history_prob=''):
+        temp_history_index = history_index
+        temp_history_prob = history_prob
+
+        for i, index in enumerate(top_indices):
+            if index == 2:
+                continue
+
+            if index == 1:
+                beam_dict[history_index + ' ' +
+                          str(index.item())] = history_prob + ' ' + str(top_probs[i].item())
+                continue
+
+            if level > level_threshold:
+                continue
+
+            else:
+                history_index = temp_history_index + ' ' + str(index.item())
+                history_prob = temp_history_prob + \
+                    ' ' + str(top_probs[i].item())
+                index = torch.tensor(index)
+
+                output_indices[:, level + 1] = index
+
+                level = level + 1
+                top_probs, top_indices = self._generate_n_predictions(
+                    input_indices, output_indices, beam_n=beam_n, level=level)
+                self._beam(input_indices, output_indices, top_indices, top_probs, beam_n, level_threshold,
+                           level=level, beam_dict=beam_dict, history_index=history_index, history_prob=history_prob)
+
+        return beam_dict
+
+    def translate(self, input_sentence, output_sentence='<sos>', padding=30, beam_n=3, level_threshold=7, ids=False):
+
+        if ids is False:
+            input_sentence = self.add_padding(input_sentence, padding)
+            output_sentence = self.add_padding(output_sentence, padding)
+
+            # Convert to indices
+            input_indices = self.english_language.sentence_to_idx(
+                input_sentence)
+            output_indices = self.norwegian_language.sentence_to_idx(
+                output_sentence)
+
+        else:
+            input_indices = input_sentence
+            output_indices = output_sentence
+
+        input_indices = torch.tensor(input_indices).view(
+            1, len(input_indices)).to(self.cuda)
+        output_indices = torch.tensor(output_indices).view(
+            1, len(output_indices)).to(self.cuda)
+
+        top_probs, top_indices = self._generate_n_predictions(
+            input_indices, output_indices, beam_n=beam_n, level=0)
+        beam_dict = self._beam(input_indices, output_indices, top_indices, top_probs,
+                               beam_n=beam_n, level_threshold=level_threshold, beam_dict={})
+
+        best_sentence = ''
+        best_log_probs = -100000
+
+        all_indices = [[int(x) for x in key.split(' ')[1:]]
+                       for key, _ in beam_dict.items()]
+        all_log_probs = [1./len(value.split(' ')[2:])**1 * np.sum([float(x)
+                                                                   for x in value.split(' ')[2:]]) for _, value in beam_dict.items()]
+
+        sorted_zip = list(
+            sorted(zip(all_log_probs, all_indices), key=lambda x: x[0], reverse=True))
+        sorted_indices = [x for _, x in sorted_zip]
+
+        # Convert Norwegian indices to sentence
+        translation = self.norwegian_language.idx_to_sentence(
+            sorted_indices[0])
+
+        # Remove <sos> and <eos>
+        translation = [word for word in translation if word != '<sos>']
+        translation = [word for word in translation if word != '<eos>']
+
+        translation = ' '.join(
+            list(filter(lambda x: x != '<pad>', translation)))
+
+        return translation
